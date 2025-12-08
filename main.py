@@ -1,5 +1,5 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
@@ -10,12 +10,10 @@ from pathlib import Path
 import logging
 import subprocess
 import json
-import asyncio
-import threading
 import time
-import requests
-from typing import Optional
+from typing import List, Dict
 import sys
+import queue
 
 # 配置日志
 logging.basicConfig(
@@ -24,12 +22,70 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="GPT-SoVITS音频处理API", version="1.0.0")
+
+# 添加文件日志处理器
+def setup_file_logger():
+    """设置文件日志处理器"""
+    # 创建logs目录
+    logs_dir = BASE_DIR / "logs"
+    logs_dir.mkdir(exist_ok=True)
+
+    # 创建日志文件，按日期命名
+    log_filename = logs_dir / f"gpt_sovits_{datetime.now().strftime('%Y%m%d')}.log"
+
+    # 创建文件处理器
+    file_handler = logging.FileHandler(log_filename, encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+
+    # 设置文件日志格式
+    file_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(file_formatter)
+
+    # 添加到logger
+    logger.addHandler(file_handler)
+
+    return log_filename
+
+
+def log_with_timestamp(message: str, level: str = "INFO", task_id: str = None):
+    """
+    带时间戳的日志记录函数
+
+    Args:
+        message: 日志消息
+        level: 日志级别 (INFO, DEBUG, WARNING, ERROR)
+        task_id: 任务ID（可选）
+    """
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    prefix = f"[{timestamp}]"
+
+    if task_id:
+        prefix += f" [任务: {task_id}]"
+
+    log_message = f"{prefix} {message}"
+
+    if level == "INFO":
+        logger.info(log_message)
+    elif level == "DEBUG":
+        logger.debug(log_message)
+    elif level == "WARNING":
+        logger.warning(log_message)
+    elif level == "ERROR":
+        logger.error(log_message)
+
+    # 同时在控制台输出
+    print(f"{timestamp} - {level} - {message}")
+
+
+app = FastAPI(title="GPT-SoVITS顺序语音API", version="3.2.0")
 
 # 配置CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:8080", "http://localhost:5173"],
+    allow_origins=["*"],  # 允许所有来源
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,388 +96,667 @@ BASE_DIR = Path(__file__).parent
 STORAGE_DIR = BASE_DIR / "voice_and_output"
 STORAGE_DIR.mkdir(exist_ok=True)
 
-# GPT-SoVITS配置
-GPT_SOVITS_API_URL = "http://127.0.0.1:9880"  # GPT-SoVITS API地址
-GPT_SOVITS_DIR = Path(r"C:/Users/24021/Desktop/GPT-SoVITS-main")  # 修改为您的实际路径
-SCRIPT1_PATH = GPT_SOVITS_DIR / "script1.py"  # script1.py路径
+# 脚本路径 - 确保 script1.py 在同一目录下
+SCRIPT_PATH = BASE_DIR / "script1.py"
+
+# 设置日志文件
+log_file_path = setup_file_logger()
+logger.info(f"日志文件已创建: {log_file_path}")
 
 
 class TextRequest(BaseModel):
     text: str
-    ref_audio_path: str  # 改为必填字段
+    ref_audio_path: str
     language: str = "zh"
+    sequential: bool = True  # 顺序生成
 
 
-class AudioResponse(BaseModel):
-    filename: str
-    message: str
-    created_at: str
-    output_path: str = None
+# 句子管理类
+class SentenceManager:
+    def __init__(self):
+        self.tasks = {}  # task_id -> task_info
+        import concurrent.futures
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)  # 单线程确保顺序
 
+    def create_task(self, task_id: str, sentences: List[str], ref_audio_path: str):
+        """创建新任务"""
+        self.tasks[task_id] = {
+            'task_id': task_id,
+            'sentences': sentences,
+            'ref_audio_path': ref_audio_path,
+            'total_sentences': len(sentences),
+            'completed_count': 0,
+            'current_index': 0,
+            'status': 'processing',
+            'start_time': time.time(),
+            'sentence_status': ['waiting'] * len(sentences),
+            'audio_data': [None] * len(sentences),
+            'audio_paths': [None] * len(sentences),
+            'callback_queue': queue.Queue()
+        }
+        return self.tasks[task_id]
 
-class ProcessingTask(BaseModel):
-    task_id: str
-    status: str
-    text: str
-    ref_audio: str
-    output_file: str = None
-    created_at: str
-    completed_at: str = None
-    error: str = None
+    def update_sentence_status(self, task_id: str, sentence_index: int, status: str, audio_data=None, audio_path=None):
+        """更新句子状态"""
+        if task_id not in self.tasks:
+            return
 
+        task = self.tasks[task_id]
+        task['sentence_status'][sentence_index] = status
 
-# 任务存储
-processing_tasks = {}
+        if status == 'completed':
+            task['audio_data'][sentence_index] = audio_data
+            task['audio_paths'][sentence_index] = audio_path
+            task['completed_count'] += 1
 
+    def get_task(self, task_id: str):
+        """获取任务信息"""
+        return self.tasks.get(task_id)
 
-def check_gpt_sovits_api():
-    """检查GPT-SoVITS API是否可用"""
-    try:
-        # 尝试访问一个存在的端点，比如 /tts 或 /control
-        response = requests.get(f"{GPT_SOVITS_API_URL}/control", params={"command": "restart"}, timeout=2)
-        # 或者直接检查服务是否在运行
-        # response = requests.get(f"{GPT_SOVITS_API_URL}", timeout=2)
-        return True if response.status_code < 500 else False
-    except requests.exceptions.ConnectionError:
-        logger.warning("无法连接到GPT-SoVITS API")
-        return False
-    except Exception as e:
-        logger.warning(f"检查GPT-SoVITS API时出错: {e}")
-        return False
+    def mark_task_completed(self, task_id: str):
+        """标记任务完成"""
+        if task_id in self.tasks:
+            self.tasks[task_id]['status'] = 'completed'
 
+    def get_task_status(self, task_id: str):
+        """获取任务状态"""
+        task = self.get_task(task_id)
+        if not task:
+            return None
 
-def start_gpt_sovits_api():
-    """启动GPT-SoVITS API服务"""
-    try:
-        # 检查API是否已在运行
-        if check_gpt_sovits_api():
-            logger.info("GPT-SoVITS API已在运行")
-            return True
-
-        # 启动API
-        api_script = GPT_SOVITS_DIR / "api_v2.py"
-        if api_script.exists():
-            logger.info("正在启动GPT-SoVITS API...")
-            # 这里可以启动子进程，但为了简单，我们假设API已手动启动
-            return True
-        else:
-            logger.error(f"找不到api_v2.py: {api_script}")
-            return False
-    except Exception as e:
-        logger.error(f"启动GPT-SoVITS API失败: {e}")
-        return False
-
-
-def run_script1(text: str, ref_audio_path: str, task_id: str):
-    """直接调用GPT-SoVITS API生成音频"""
-    try:
-        GPT_SOVITS_API = "http://127.0.0.1:9880"
-
-        # 构建请求参数
-        params = {
-            "text": text,
-            "text_lang": "zh",
-            "ref_audio_path": ref_audio_path,
-            "prompt_lang": "zh",
-            "prompt_text": "",
-            "top_k": 5,
-            "top_p": 1.0,
-            "temperature": 1.0,
-            "text_split_method": "cut5",
-            "batch_size": 1,
-            "speed_factor": 1.0,
-            "media_type": "wav"
+        return {
+            'task_id': task_id,
+            'status': task['status'],
+            'total_sentences': task['total_sentences'],
+            'completed_count': task['completed_count'],
+            'current_index': task['current_index'],
+            'elapsed_time': time.time() - task['start_time'],
+            'sentence_statuses': task['sentence_status'],
+            'audio_files': [
+                {
+                    'sentence_index': i,
+                    'filename': Path(path).name if path else None,
+                    'file_path': path,
+                    'status': task['sentence_status'][i]
+                }
+                for i, path in enumerate(task['audio_paths'])
+                if path
+            ]
         }
 
-        logger.info(f"调用GPT-SoVITS API: {params}")
+    def cleanup(self, task_id: str):
+        """清理任务资源"""
+        if task_id in self.tasks:
+            del self.tasks[task_id]
 
-        # 调用API
-        response = requests.get(f"{GPT_SOVITS_API}/tts", params=params, timeout=300)
 
-        if response.status_code == 200:
-            # 保存音频文件
-            output_dir = Path(__file__).parent / "voice_and_output"
-            output_dir.mkdir(exist_ok=True)
+# 全局句子管理器
+sentence_manager = SentenceManager()
 
-            # 生成唯一文件名
-            unique_name = f"output_{task_id}.wav"
-            unique_path = output_dir / unique_name
 
-            # 保存音频文件
-            with open(unique_path, 'wb') as f:
-                f.write(response.content)
+def split_text_by_sentences(text: str) -> List[str]:
+    """改进的文本分割函数，正确处理数字+点的情况，包括小数点"""
+    import re
 
-            logger.info(f"音频文件已保存: {unique_path}, 大小: {os.path.getsize(unique_path)} bytes")
+    # 首先处理小数点：将数字中的小数点替换为特殊标记
+    # 匹配模式：数字 + 点 + 数字（例如：3.14、6.98、0.5）
+    text = re.sub(r'(\d+)\.(\d+)', r'\1[DOT]\2', text)
 
-            processing_tasks[task_id].status = "completed"
-            processing_tasks[task_id].output_file = str(unique_path)
-            processing_tasks[task_id].completed_at = datetime.now().isoformat()
+    # 处理序数点：匹配模式：数字 + 点 + 非数字（例如：1.、2.、3.等）
+    text = re.sub(r'(\d+)\.(\s|$)', r'\1\2', text)
 
-            return str(unique_path)
+    # 先按标点分割
+    sentences = []
+    buffer = []
+
+    # 定义句子结束符
+    sentence_end_chars = {'。', '！', '？', '；', '.', '!', '?', ';', '…'}
+
+    i = 0
+    length = len(text)
+
+    while i < length:
+        char = text[i]
+
+        # 检查是否是省略号
+        if char == '.' and i + 2 < length and text[i + 1] == '.' and text[i + 2] == '.':
+            buffer.append('...')
+            i += 3  # 跳过三个点
+            continue
+
+        buffer.append(char)
+
+        # 检查是否是句子结束
+        if char in sentence_end_chars:
+            # 再次检查是否是数字+点的情况
+            if char == '.' and buffer:
+                # 检查除当前点外的所有字符
+                temp_str = ''.join(buffer[:-1])
+                if temp_str.strip().isdigit():
+                    # 删除数字后面的点
+                    buffer.pop()
+                    i += 1
+                    continue
+
+            # 检查后面是否有括号或其他可能不是句子结束的情况
+            is_real_end = True
+            if i + 1 < length:
+                next_char = text[i + 1]
+                # 如果后面是右括号、右引号等，可能是句子结束
+                if next_char in ['）', '」', '》', '】', ')', ']', '}']:
+                    is_real_end = True
+                # 如果后面是小写字母或数字，可能不是句子结束
+                elif next_char.islower() or next_char.isdigit():
+                    is_real_end = False
+                # 如果后面是空格或换行，可能是句子结束
+                elif next_char in [' ', '\n', '\t']:
+                    # 再检查空格后面是什么
+                    j = i + 2
+                    while j < length and text[j] in [' ', '\n', '\t']:
+                        j += 1
+                    if j < length and text[j].islower():
+                        is_real_end = False
+
+            if is_real_end:
+                sentence = ''.join(buffer).strip()
+                if sentence:
+                    sentences.append(sentence)
+                buffer = []
+
+        i += 1
+
+    # 处理最后一句
+    if buffer:
+        # 最后检查数字+点的情况
+        if buffer and buffer[-1] == '.':
+            temp_str = ''.join(buffer[:-1])
+            if temp_str.strip().isdigit():
+                buffer.pop()  # 删除数字后的点
+
+        sentence = ''.join(buffer).strip()
+        if sentence:
+            sentences.append(sentence)
+
+    # 清理空句子
+    sentences = [s for s in sentences if s.strip()]
+
+    # 合并过短的句子
+    merged_sentences = []
+    temp_buffer = []
+
+    for sentence in sentences:
+        # 如果句子包含标点，先检查是否需要合并
+        if len(sentence) < 10 and sentence != sentences[-1]:
+            # 检查句子是否以句子结束符结尾
+            if sentence and sentence[-1] not in sentence_end_chars:
+                temp_buffer.append(sentence)
+                continue
+
+        if temp_buffer:
+            temp_buffer.append(sentence)
+            merged = ''.join(temp_buffer)
+            merged_sentences.append(merged)
+            temp_buffer = []
         else:
+            merged_sentences.append(sentence)
+
+    # 处理剩余的缓冲区
+    if temp_buffer:
+        merged = ''.join(temp_buffer)
+        merged_sentences.append(merged)
+
+    # 恢复小数点标记为汉字"点"
+    final_sentences = []
+    for sentence in merged_sentences:
+        # 将 [DOT] 替换为汉字"点"
+        sentence = sentence.replace('[DOT]', '点')
+        final_sentences.append(sentence)
+
+    logger.info(f"将文本切分为 {len(final_sentences)} 个句子")
+    for idx, sentence in enumerate(final_sentences):
+        logger.debug(f"句子 {idx + 1}: {sentence[:50]}{'...' if len(sentence) > 50 else ''}")
+
+    return final_sentences
+
+
+def generate_sentence_with_script(sentence: str, ref_audio_path: str, task_id: str, sentence_index: int):
+    """使用script1.py直接生成单个句子的音频"""
+    try:
+        # 记录开始生成句子
+        send_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        log_with_timestamp(
+            f"开始生成句子 {sentence_index} (长度: {len(sentence)} 字符)",
+            "INFO",
+            task_id
+        )
+
+        log_with_timestamp(f"句子 {sentence_index} 发送到script1.py时间: {send_time}", "INFO", task_id)
+        log_with_timestamp(f"句子 {sentence_index} 完整内容: {sentence}", "DEBUG", task_id)
+
+        # 生成唯一的任务ID用于这个句子
+        sub_task_id = f"{task_id}_s{sentence_index}"
+
+        # 构建命令 - 直接调用script1.py
+        cmd = [
+            sys.executable,  # 使用当前的Python解释器
+            str(SCRIPT_PATH),
+            "--text", sentence,
+            "--text-lang", "zh",
+            "--ref-audio", ref_audio_path,
+            "--task-id", sub_task_id,
+            "--top-k", "5",
+            "--top-p", "1.0",
+            "--temperature", "1.0",
+            "--speed", "1.0",
+            "--clean-old"  # 清理旧的output.wav文件
+        ]
+
+        log_with_timestamp(f"执行命令: {' '.join(cmd[:10])}...", "INFO", task_id)
+
+        # 执行命令并计时
+        cmd_start_time = time.time()
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            timeout=180  # 增加到180秒超时
+        )
+
+        # 记录命令执行时间
+        cmd_time = time.time() - cmd_start_time
+        log_with_timestamp(f"script1.py执行耗时: {cmd_time:.2f}秒", "INFO", task_id)
+
+        if result.returncode != 0:
+            error_msg = f"script1.py执行失败: {result.stderr}"
+            log_with_timestamp(f"句子 {sentence_index} 生成失败: {error_msg}", "ERROR", task_id)
+            raise Exception(f"生成失败: {result.stderr}")
+
+        # 解析输出（JSON格式）
+        audio_file = None
+        try:
+            # 获取最后一行JSON输出
+            output_lines = result.stdout.strip().split('\n')
+            json_line = None
+
+            # 从最后一行开始找JSON
+            for line in reversed(output_lines):
+                line = line.strip()
+                if line and (line.startswith('{') and line.endswith('}')):
+                    json_line = line
+                    break
+
+            if json_line:
+                output_json = json.loads(json_line)
+                log_with_timestamp(f"script1.py返回JSON状态: {output_json.get('status')}", "DEBUG", task_id)
+
+                # 检查返回状态
+                if output_json.get("status") == "success":
+                    # 从返回中获取文件路径
+                    unique_output = output_json.get("unique_output")
+                    default_output = output_json.get("default_output")
+                    output_path = output_json.get("output_path")
+
+                    # 优先使用unique_output，如果没有则使用default_output或output_path
+                    if unique_output and Path(unique_output).exists():
+                        audio_file = Path(unique_output)
+                    elif default_output and Path(default_output).exists():
+                        audio_file = Path(default_output)
+                    elif output_path and Path(output_path).exists():
+                        audio_file = Path(output_path)
+                    else:
+                        log_with_timestamp(f"JSON中未找到有效文件路径", "WARNING", task_id)
+                else:
+                    error_msg = output_json.get('message', '未知错误')
+                    raise Exception(f"script1.py返回错误: {error_msg}")
+            else:
+                log_with_timestamp("script1.py未返回有效的JSON输出", "WARNING", task_id)
+
+        except json.JSONDecodeError as e:
+            log_with_timestamp(f"无法解析script1.py输出为JSON: {e}", "WARNING", task_id)
+            log_with_timestamp(f"原始输出最后100字符: {result.stdout[-100:]}", "DEBUG", task_id)
+        except Exception as e:
+            log_with_timestamp(f"解析script1.py输出失败: {e}", "ERROR", task_id)
+
+        # 如果通过JSON没找到文件，尝试查找生成的音频文件
+        if audio_file is None or not audio_file.exists():
+            output_dir = Path("C:\\Users\\24021\\Desktop\\GPT-SoVITS-main")
+
+            # 尝试多个可能的文件名
+            possible_files = [
+                output_dir / f"output_{sub_task_id}.wav",
+                output_dir / "output.wav",
+                STORAGE_DIR / f"output_{sub_task_id}.wav",
+                STORAGE_DIR / "output.wav"
+            ]
+
+            for file_path in possible_files:
+                if file_path.exists():
+                    audio_file = file_path
+                    log_with_timestamp(f"找到音频文件: {audio_file}", "INFO", task_id)
+                    break
+
+        # 检查音频文件是否存在
+        if audio_file is None or not audio_file.exists():
+            error_msg = f"未找到生成的音频文件"
+            log_with_timestamp(error_msg, "ERROR", task_id)
+
+            # 列出目录内容以帮助调试
             try:
-                error_info = response.json()
-                error_msg = f"GPT-SoVITS API调用失败: {error_info.get('message', '未知错误')}"
-            except:
-                error_msg = f"GPT-SoVITS API调用失败，状态码: {response.status_code}"
+                output_dir = Path("C:\\Users\\24021\\Desktop\\GPT-SoVITS-main")
+                if output_dir.exists():
+                    files = list(output_dir.glob("*.wav"))
+                    log_with_timestamp(f"GPT-SoVITS目录中的wav文件: {[f.name for f in files[:10]]}", "DEBUG", task_id)
+
+                if STORAGE_DIR.exists():
+                    files = list(STORAGE_DIR.glob("*.wav"))
+                    log_with_timestamp(f"存储目录中的wav文件: {[f.name for f in files[:10]]}", "DEBUG", task_id)
+            except Exception as e:
+                log_with_timestamp(f"无法列出目录内容: {e}", "ERROR", task_id)
+
             raise Exception(error_msg)
 
+        # 读取音频数据
+        with open(audio_file, 'rb') as f:
+            audio_data = f.read()
+
+        # 记录生成成功
+        success_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        total_time = time.time() - cmd_start_time
+        log_with_timestamp(
+            f"✓ 句子 {sentence_index} 生成成功，文件大小: {len(audio_data)} bytes",
+            "INFO",
+            task_id
+        )
+        log_with_timestamp(f"句子 {sentence_index} 生成成功时间: {success_time}", "INFO", task_id)
+        log_with_timestamp(f"句子 {sentence_index} 总耗时: {total_time:.2f}秒", "INFO", task_id)
+        log_with_timestamp(f"音频文件位置: {audio_file}", "INFO", task_id)
+
+        # 更新句子状态
+        sentence_manager.update_sentence_status(
+            task_id,
+            sentence_index,
+            'completed',
+            audio_data=audio_data,
+            audio_path=str(audio_file)
+        )
+
+        return audio_data, str(audio_file)
+
+    except subprocess.TimeoutExpired:
+        log_with_timestamp(f"句子 {sentence_index} 生成超时（超过180秒）", "ERROR", task_id)
+        sentence_manager.update_sentence_status(task_id, sentence_index, 'error')
+        return None, None
     except Exception as e:
-        logger.error(f"调用GPT-SoVITS API失败: {e}")
-        processing_tasks[task_id].status = "failed"
-        processing_tasks[task_id].error = str(e)
-        processing_tasks[task_id].completed_at = datetime.now().isoformat()
-        raise
+        log_with_timestamp(f"句子 {sentence_index} 生成失败: {e}", "ERROR", task_id)
+        sentence_manager.update_sentence_status(task_id, sentence_index, 'error')
+        return None, None
+
+
+def process_sentences_sequential(text: str, ref_audio_path: str, task_id: str):
+    """顺序处理所有句子 - 逐个生成"""
+    try:
+        # 切分句子
+        sentences = split_text_by_sentences(text)
+        log_with_timestamp(f"任务 {task_id} 开始处理 {len(sentences)} 个句子", "INFO", task_id)
+
+        # 创建任务
+        task_info = sentence_manager.create_task(task_id, sentences, ref_audio_path)
+
+        # 顺序生成每个句子
+        for i, sentence in enumerate(sentences):
+            # 更新为处理中状态
+            sentence_manager.update_sentence_status(task_id, i, 'processing')
+
+            # 记录进度
+            progress = (i / len(sentences)) * 100 if len(sentences) > 0 else 0
+            log_with_timestamp(f"开始处理句子 {i + 1}/{len(sentences)} (进度: {progress:.1f}%)", "INFO", task_id)
+
+            # 生成当前句子
+            audio_data, audio_path = generate_sentence_with_script(
+                sentence, ref_audio_path, task_id, i
+            )
+
+            if audio_data:
+                # 计算当前进度
+                current_progress = ((i + 1) / len(sentences)) * 100
+                log_with_timestamp(f"✓ 句子 {i} 完成，进度: {current_progress:.1f}%", "INFO", task_id)
+
+        # 标记任务完成
+        sentence_manager.mark_task_completed(task_id)
+        log_with_timestamp(f"✓ 任务 {task_id} 所有句子处理完成", "INFO", task_id)
+
+        # 记录总耗时
+        total_time = time.time() - task_info['start_time']
+        log_with_timestamp(f"任务总耗时: {total_time:.2f}秒", "INFO", task_id)
+        log_with_timestamp(f"平均每句子耗时: {total_time / len(sentences):.2f}秒", "INFO", task_id)
+
+    except Exception as e:
+        log_with_timestamp(f"任务 {task_id} 处理失败: {e}", "ERROR", task_id)
+        sentence_manager.cleanup(task_id)
+
 
 @app.get("/")
 async def root():
     """根端点"""
+    log_with_timestamp("收到根端点请求")
     return {
-        "message": "GPT-SoVITS音频处理API服务运行中",
-        "status": "ok",
-        "gpt_sovits_api_available": check_gpt_sovits_api()
+        "message": "GPT-SoVITS顺序语音API",
+        "version": "3.2.0",
+        "features": ["顺序语音生成", "智能文本分割", "无缝播放衔接", "script1.py集成"],
+        "status": "ready",
+        "log_file": str(log_file_path)
     }
 
 
-@app.get("/health")
-async def health_check():
-    """健康检查"""
-    gpt_sovits_status = "available" if check_gpt_sovits_api() else "unavailable"
-
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "storage_dir": str(STORAGE_DIR),
-        "gpt_sovits_status": gpt_sovits_status,
-        "endpoints": {
-            "upload": "/upload",
-            "process": "/process",
-            "files": "/files"
-        }
-    }
-
-@app.post("/upload", response_model=AudioResponse)
-async def upload_audio(file: UploadFile = File(...)):
-    """
-    上传WAV音频文件作为参考音频
-    """
-    try:
-        # 检查文件类型
-        if not file.filename.lower().endswith('.wav'):
-            raise HTTPException(status_code=400, detail="只支持WAV格式文件")
-
-        # 生成唯一文件名（保留原始文件名便于识别）
-        original_name = Path(file.filename).stem
-        unique_filename = f"{original_name}_{uuid.uuid4().hex[:8]}.wav"
-        file_path = STORAGE_DIR / unique_filename
-
-        # 保存文件
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        logger.info(f"参考音频已保存: {file_path}")
-
-        return AudioResponse(
-            filename=unique_filename,
-            message=f"参考音频上传成功",
-            created_at=datetime.now().isoformat(),
-            output_path=str(file_path)
-        )
-
-    except Exception as e:
-        logger.error(f"上传失败: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"上传失败: {str(e)}")
-
-
-@app.post("/process", response_model=dict)
+@app.post("/process")
 async def process_text(request: TextRequest, background_tasks: BackgroundTasks):
     """
-    处理文本并生成音频文件
+    处理文本并开始语音生成
     """
     try:
         if not request.text.strip():
             raise HTTPException(status_code=400, detail="文本内容不能为空")
 
-        # 检查参考音频文件是否存在
+        # 检查参考音频文件
         ref_audio_path = Path(request.ref_audio_path)
         if not ref_audio_path.exists():
-            # 先在当前存储目录查找
             stored_path = STORAGE_DIR / ref_audio_path.name
             if stored_path.exists():
                 ref_audio_path = stored_path
             else:
-                raise HTTPException(status_code=404, detail=f"参考音频文件不存在: {request.ref_audio_path}")
+                raise HTTPException(status_code=404, detail="参考音频文件不存在")
+
+        # 检查script1.py是否存在
+        if not SCRIPT_PATH.exists():
+            raise HTTPException(
+                status_code=500,
+                detail="script1.py不存在，请确保它在后端目录中"
+            )
 
         # 生成任务ID
         task_id = f"task_{uuid.uuid4().hex[:8]}"
 
-        # 创建任务记录
-        task = ProcessingTask(
-            task_id=task_id,
-            status="processing",
-            text=request.text,
-            ref_audio=str(ref_audio_path),
-            created_at=datetime.now().isoformat()
+        # 记录前端请求
+        receive_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        log_with_timestamp(
+            f"接收到前端文本处理请求 - 文本长度: {len(request.text)} 字符, 参考音频: {ref_audio_path.name}",
+            "INFO",
+            task_id
         )
+        log_with_timestamp(f"请求接收时间: {receive_time}", "INFO", task_id)
 
-        processing_tasks[task_id] = task
+        # 记录文本内容预览
+        text_preview = request.text[:100] + ("..." if len(request.text) > 100 else "")
+        log_with_timestamp(f"处理文本内容预览: {text_preview}", "INFO", task_id)
 
-        # 在后台运行音频生成
+        # 切分句子
+        sentences = split_text_by_sentences(request.text)
+        log_with_timestamp(f"文本切分为 {len(sentences)} 个句子", "INFO", task_id)
+
+        # 在后台开始顺序处理
         background_tasks.add_task(
-            run_script1,
+            process_sentences_sequential,
             text=request.text,
             ref_audio_path=str(ref_audio_path),
             task_id=task_id
         )
 
+        log_with_timestamp(f"任务已开始后台处理，总句子数: {len(sentences)}", "INFO", task_id)
+
         return {
             "task_id": task_id,
             "status": "started",
-            "message": "音频生成任务已开始",
-            "created_at": task.created_at,
-            "check_status_url": f"/task/{task_id}/status",
-            "ref_audio": str(ref_audio_path)  # 返回实际使用的路径
+            "message": "顺序语音生成已开始",
+            "sentences_count": len(sentences),
+            "sentences": sentences,
+            "mode": "sequential",
+            "created_at": datetime.now().isoformat(),
+            "log_file": str(log_file_path)
         }
 
     except Exception as e:
         logger.error(f"处理失败: {str(e)}")
         raise HTTPException(status_code=500, detail=f"处理失败: {str(e)}")
 
+
 @app.get("/task/{task_id}/status")
 async def get_task_status(task_id: str):
     """获取任务状态"""
-    if task_id not in processing_tasks:
+    log_with_timestamp(f"获取任务状态请求: {task_id}", "INFO")
+    status = sentence_manager.get_task_status(task_id)
+    if not status:
+        return {
+            "task_id": task_id,
+            "status": "not_found",
+            "message": "任务不存在或已结束"
+        }
+
+    return status
+
+
+@app.get("/task/{task_id}/audios")
+async def get_task_audios(task_id: str):
+    """获取任务的所有音频文件信息"""
+    log_with_timestamp(f"获取任务音频列表请求: {task_id}", "INFO")
+    task = sentence_manager.get_task(task_id)
+    if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
 
-    task = processing_tasks[task_id]
+    audio_files = []
 
-    response = {
-        "task_id": task.task_id,
-        "status": task.status,
-        "text": task.text,
-        "ref_audio": task.ref_audio,
-        "created_at": task.created_at,
-        "completed_at": task.completed_at,
-        "error": task.error
+    for i in range(task['total_sentences']):
+        if task['audio_paths'][i] and Path(task['audio_paths'][i]).exists():
+            audio_path = task['audio_paths'][i]
+            filename = Path(audio_path).name
+
+            # 构建文件信息
+            audio_info = {
+                "sentence_index": i,
+                "filename": filename,
+                "sentence_text": task['sentences'][i] if i < len(task['sentences']) else f"句子 {i + 1}",
+                "status": task['sentence_status'][i],
+                "url": f"/audio/{task_id}/{filename}",
+                "file_size": os.path.getsize(audio_path) if Path(audio_path).exists() else 0,
+                "created_at": datetime.now().isoformat()
+            }
+            audio_files.append(audio_info)
+
+    log_with_timestamp(f"返回任务 {task_id} 的 {len(audio_files)} 个音频文件信息", "INFO")
+
+    return {
+        "task_id": task_id,
+        "total_sentences": task['total_sentences'],
+        "completed_count": task['completed_count'],
+        "status": task['status'],
+        "audio_files": audio_files
     }
 
-    if task.status == "completed" and task.output_file:
-        response["output_file"] = task.output_file
-        response["download_url"] = f"/audio/{Path(task.output_file).name}"
 
-    return response
-
-
-@app.get("/audio/{filename}")
-async def get_audio(filename: str):
-    """
-    获取生成的音频文件
-    """
-    file_path = STORAGE_DIR / filename
-
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="文件不存在")
-
-    if not file_path.is_file():
-        raise HTTPException(status_code=400, detail="无效的文件路径")
-
-    # 检查文件大小
-    file_size = file_path.stat().st_size
-    if file_size == 0:
-        raise HTTPException(status_code=500, detail="音频文件为空")
-
-    return FileResponse(
-        path=file_path,
-        filename=filename,
-        media_type="audio/wav",
-        headers={
-            "Content-Disposition": f"attachment; filename={filename}",
-            "Content-Length": str(file_size)
-        }
-    )
-
-
-@app.get("/files")
-async def list_files():
-    """
-    列出所有音频文件
-    """
-    files = []
-    for file_path in STORAGE_DIR.glob("*.wav"):
-        stats = file_path.stat()
-        files.append({
-            "filename": file_path.name,
-            "path": str(file_path),
-            "size": stats.st_size,
-            "created_at": datetime.fromtimestamp(stats.st_ctime).isoformat(),
-            "is_output": "output_" in file_path.name,
-            "is_uploaded": "output_" not in file_path.name
-        })
-
-    # 按创建时间排序（最新的在前面）
-    files.sort(key=lambda x: x["created_at"], reverse=True)
-
-    return {"files": files, "count": len(files)}
-
-
-@app.delete("/audio/{filename}")
-async def delete_audio(filename: str):
-    """删除音频文件"""
+@app.get("/audio/{task_id}/{filename}")
+async def serve_audio_file(task_id: str, filename: str):
+    """提供生成的音频文件"""
     try:
-        file_path = STORAGE_DIR / filename
+        log_with_timestamp(f"音频文件请求: {filename} (任务: {task_id})", "INFO")
 
+        # 首先在GPT-SoVITS输出目录查找
+        gpt_output_dir = Path("C:\\Users\\24021\\Desktop\\GPT-SoVITS-main")
+        file_path = gpt_output_dir / filename
+
+        # 如果不在GPT目录，尝试在存储目录查找
         if not file_path.exists():
-            raise HTTPException(status_code=404, detail="文件不存在")
+            file_path = STORAGE_DIR / filename
 
-        file_path.unlink()
+        # 如果还是找不到，尝试查找任务相关的文件
+        if not file_path.exists():
+            task = sentence_manager.get_task(task_id)
+            if task:
+                # 查找音频路径列表中的文件
+                for audio_path in task['audio_paths']:
+                    if audio_path and Path(audio_path).name == filename:
+                        file_path = Path(audio_path)
+                        break
 
-        logger.info(f"已删除文件: {filename}")
+        if file_path.exists() and file_path.is_file():
+            log_with_timestamp(f"提供音频文件: {file_path}", "INFO")
+            return FileResponse(
+                file_path,
+                media_type="audio/wav",
+                filename=filename
+            )
 
-        return {"message": f"文件 {filename} 已删除", "success": True}
+        log_with_timestamp(f"音频文件未找到: {filename}", "WARNING")
+        raise HTTPException(status_code=404, detail="音频文件未找到")
 
     except Exception as e:
-        logger.error(f"删除文件失败: {e}")
-        raise HTTPException(status_code=500, detail=f"删除失败: {str(e)}")
+        log_with_timestamp(f"提供音频文件失败: {str(e)}", "ERROR")
+        raise HTTPException(status_code=500, detail=f"文件服务错误: {str(e)}")
 
 
-@app.get("/cleanup")
-async def cleanup_old_files(days: int = 7):
-    """清理旧文件"""
+# 文件上传端点
+@app.post("/upload")
+async def upload_audio(file: UploadFile = File(...)):
+    """上传WAV音频文件"""
     try:
-        cutoff_time = time.time() - (days * 24 * 60 * 60)
-        deleted_files = []
+        upload_start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        log_with_timestamp(f"开始上传文件: {file.filename}", "INFO")
 
-        for file_path in STORAGE_DIR.glob("*"):
-            if file_path.is_file():
-                file_age = time.time() - file_path.stat().st_ctime
-                if file_age > cutoff_time:
-                    file_path.unlink()
-                    deleted_files.append(file_path.name)
+        if not file.filename.lower().endswith('.wav'):
+            raise HTTPException(status_code=400, detail="只支持WAV格式文件")
+
+        original_name = Path(file.filename).stem
+        unique_filename = f"{original_name}_{uuid.uuid4().hex[:8]}.wav"
+        file_path = STORAGE_DIR / unique_filename
+
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        upload_end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        log_with_timestamp(f"参考音频已保存: {file_path}", "INFO")
+        log_with_timestamp(f"上传时间: {upload_start_time} -> {upload_end_time}", "INFO")
+        log_with_timestamp(f"文件大小: {os.path.getsize(file_path)} bytes", "INFO")
 
         return {
-            "message": f"已清理 {len(deleted_files)} 个文件",
-            "deleted_files": deleted_files,
-            "success": True
+            "filename": unique_filename,
+            "original_name": original_name,
+            "message": "参考音频上传成功",
+            "created_at": datetime.now().isoformat(),
+            "output_path": str(file_path),
+            "file_size": os.path.getsize(file_path)
         }
 
     except Exception as e:
-        logger.error(f"清理文件失败: {e}")
-        raise HTTPException(status_code=500, detail=f"清理失败: {str(e)}")
+        log_with_timestamp(f"上传失败: {str(e)}", "ERROR")
+        raise HTTPException(status_code=500, detail=f"上传失败: {str(e)}")
 
 
-# 启动时检查GPT-SoVITS API
 @app.on_event("startup")
 async def startup_event():
-    logger.info("启动GPT-SoVITS音频处理API...")
+    logger.info("启动GPT-SoVITS顺序语音API v3.2...")
     logger.info(f"存储目录: {STORAGE_DIR}")
-    logger.info(f"GPT-SoVITS目录: {GPT_SOVITS_DIR}")
-
-    # 检查GPT-SoVITS API
-    if check_gpt_sovits_api():
-        logger.info("✓ GPT-SoVITS API可用")
-    else:
-        logger.warning("⚠ GPT-SoVITS API不可用，请确保已启动api_v2.py")
-        logger.info(f"请手动启动: python {GPT_SOVITS_DIR}/api_v2.py")
+    logger.info(f"脚本路径: {SCRIPT_PATH}")
+    logger.info(f"日志文件: {log_file_path}")
+    logger.info("模式: 直接调用script1.py生成音频")
 
 
 if __name__ == "__main__":
